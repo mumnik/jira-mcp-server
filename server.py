@@ -607,6 +607,47 @@ def _version_url(project_key: str, version_id: str | int) -> str:
     return f"{JIRA_URL}/projects/{project_key}/versions/{version_id}"
 
 
+_BUILD_PREFIX = "Build: "
+
+
+def _normalize_tags(tag: "str | list[str] | None") -> "list[str] | None":
+    """Coerce a tag argument into a clean list, or None when none was passed.
+
+    Accepts a single string ('core-1.0.85'), a comma-separated string
+    ('core-1.0.85, www-3.1.87'), or a list. Returns None (meaning "leave the
+    build untouched") only when tag itself is None — an explicit [] or '' clears
+    it.
+    """
+    if tag is None:
+        return None
+    raw = tag.split(",") if isinstance(tag, str) else list(tag)
+    return [str(t).strip() for t in raw if str(t).strip()]
+
+
+def _split_build_line(description: "str | None") -> "tuple[list[str], str]":
+    """Split a version description into (build tags, remaining body).
+
+    The build tags live on a leading 'Build: a, b' line; everything after it is
+    the human description. A description without that line yields ([], body).
+    """
+    if not description:
+        return [], ""
+    first, _, rest = description.partition("\n")
+    if first.startswith(_BUILD_PREFIX):
+        tags = [t.strip() for t in first[len(_BUILD_PREFIX):].split(",") if t.strip()]
+        return tags, rest.lstrip("\n")
+    return [], description
+
+
+def _compose_description(body: "str | None", tags: "list[str]") -> str:
+    """Re-assemble a version description from its body and build tags."""
+    body = (body or "").strip()
+    if tags:
+        head = _BUILD_PREFIX + ", ".join(tags)
+        return head + ("\n\n" + body if body else "")
+    return body
+
+
 def _dated_version_name(existing: set[str], day: str) -> str:
     """Pick the next version name for a day under the ticketshop convention.
 
@@ -673,6 +714,7 @@ def create_version(
     release_date: str | None = None,
     released: bool = False,
     date: str | None = None,
+    tag: "str | list[str] | None" = None,
     allow_cyrillic: bool = False,
 ) -> str:
     """Create a release (version) in a project. Name and description MUST be in English.
@@ -693,6 +735,10 @@ def create_version(
             create it open, tag issues, then release it with update_version)
         date: Day for the auto-generated name as 'YYYY-MM-DD' (default today).
             Ignored when `name` is given.
+        tag: Build tag(s) shipped in this release — the thing the dated name
+            doesn't tell you. A string ('core-1.0.85'), a comma-separated string,
+            or a list (['core-1.0.85', 'www-3.1.87']) for a multi-service release.
+            Stored on a leading 'Build: ...' line of the version description.
         allow_cyrillic: Escape hatch for legitimately Cyrillic text (a quoted log
             line, a UI string). Do not set it to write Russian prose.
     """
@@ -724,8 +770,10 @@ def create_version(
             "projectId": project_id,
             "released": released,
         }
-        if description:
-            payload["description"] = description
+        tags = _normalize_tags(tag) or []
+        final_desc = _compose_description(description, tags)
+        if final_desc:
+            payload["description"] = final_desc
         if start_date:
             payload["startDate"] = start_date
         if release_date:
@@ -741,6 +789,7 @@ def create_version(
         "name": data.get("name"),
         "released": data.get("released", False),
         "releaseDate": data.get("releaseDate"),
+        "build": tags,
         "url": _version_url(project_key, data["id"]),
     }, indent=2)
 
@@ -754,6 +803,7 @@ def update_version(
     release_date: str | None = None,
     released: bool | None = None,
     archived: bool | None = None,
+    tag: "str | list[str] | None" = None,
     allow_cyrillic: bool = False,
 ) -> str:
     """Edit a release (version): rename, set dates, release it, or archive it.
@@ -765,21 +815,38 @@ def update_version(
     Args:
         version_id: The version id (numeric string), from list_versions
         name: New name. English only. Omit to keep current.
-        description: New description. English only. Omit to keep current.
+        description: New description (the body below the Build line). English
+            only. Omit to keep current. Pass '' to clear the body.
         start_date: Start date 'YYYY-MM-DD', or '' to clear. Omit to keep current.
         release_date: Release date 'YYYY-MM-DD', or '' to clear. Omit to keep current.
         released: Mark released (True) / unreleased (False). Omit to keep current.
         archived: Archive (True) / unarchive (False). Omit to keep current.
+        tag: Replace the build tag(s) on the 'Build: ...' line (string, comma-
+            separated string, or list). Omit to keep current; pass [] or '' to
+            clear them. The human description body is preserved either way.
         allow_cyrillic: Escape hatch for legitimately Cyrillic text.
     """
     _require_english("name", name, allow_cyrillic)
     _require_english("description", description, allow_cyrillic)
 
+    tags = _normalize_tags(tag)
+
     payload: dict = {}
     if name is not None:
         payload["name"] = name
-    if description is not None:
-        payload["description"] = description
+    if description is not None or tags is not None:
+        # Build line and body are stored together in one description field, so
+        # when only one of them is being changed, read the current value and
+        # preserve the other half.
+        cur_tags, cur_body = [], ""
+        if description is None or tags is None:
+            with _client() as client:
+                cur = client.get(f"/rest/api/3/version/{version_id}")
+                if cur.status_code < 400:
+                    cur_tags, cur_body = _split_build_line(cur.json().get("description") or "")
+        new_body = description if description is not None else cur_body
+        new_tags = tags if tags is not None else cur_tags
+        payload["description"] = _compose_description(new_body, new_tags)
     if start_date is not None:
         payload["startDate"] = start_date
     if release_date is not None:
@@ -906,12 +973,14 @@ def release_notes(
 
         # Best-effort release metadata for the header.
         released_on = None
+        build_tags: list[str] = []
         if project_key and version_name:
             vresp = client.get(f"/rest/api/3/project/{project_key}/versions")
             if vresp.status_code < 400:
                 for v in vresp.json():
                     if v.get("name") == version_name:
                         released_on = v.get("releaseDate")
+                        build_tags, _ = _split_build_line(v.get("description") or "")
                         break
 
     # Group.
@@ -939,6 +1008,8 @@ def release_notes(
     lines = [f"# {title} — Release notes"]
     if released_on:
         lines.append(f"\n_Released: {released_on}_")
+    if build_tags:
+        lines.append(f"\n_Build: {', '.join(build_tags)}_")
     lines.append(f"\n_{len(issues)} issue(s)_\n")
 
     for bucket in sorted(groups):
