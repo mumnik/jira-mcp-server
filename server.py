@@ -5,10 +5,11 @@
 # dependencies = ["fastmcp>=2.0", "httpx"]
 # ///
 
+import html
 import json
 import os
 import re
-from datetime import date as _date
+from datetime import date as _date, datetime as _datetime
 
 import httpx
 from fastmcp import FastMCP
@@ -412,6 +413,15 @@ def transition_issue(issue_key: str, transition_name: str) -> str:
 # same credentials as Jira, so it reuses _client() / JIRA_URL.
 
 CONFLUENCE_BASE = "/wiki"
+
+# The Jira single-issue Confluence macro needs the application-link id between
+# this Confluence site and Jira. It is site-specific (not in any API response
+# we can cheaply query), so it is captured here from a page the native Jira
+# "Release notes" blueprint produced, and overridable via env for other sites.
+JIRA_SERVER_ID = os.environ.get(
+    "JIRA_CONFLUENCE_SERVER_ID", "000bdcc6-aa03-3ac3-88d7-8720a56489e2"
+)
+JIRA_SERVER_NAME = os.environ.get("JIRA_CONFLUENCE_SERVER_NAME", "System Jira")
 
 
 def _conf_space_id(client: httpx.Client, space_key: str) -> str:
@@ -1022,6 +1032,220 @@ def release_notes(
         lines.append("_No issues found for this release._")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _jira_issue_macro(key: str) -> str:
+    """A Confluence single-issue Jira macro — renders as a live issue card."""
+    return (
+        '<ac:structured-macro ac:name="jira" ac:schema-version="1">'
+        f'<ac:parameter ac:name="key">{html.escape(key)}</ac:parameter>'
+        f'<ac:parameter ac:name="serverId">{html.escape(JIRA_SERVER_ID)}</ac:parameter>'
+        f'<ac:parameter ac:name="server">{html.escape(JIRA_SERVER_NAME)}</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+
+
+def _desc_cell(description: str) -> str:
+    """Render a version description as storage-format paragraphs."""
+    lines = [ln for ln in (description or "").split("\n") if ln.strip()]
+    if not lines:
+        return "<p />"
+    return "".join(f"<p>{html.escape(ln)}</p>" for ln in lines)
+
+
+def _release_page_body(
+    version_url: str,
+    version_name: str,
+    release_date: str | None,
+    description: str,
+    issues: list[dict],
+    contributor_ids: list[str],
+) -> str:
+    """Build the storage-format body matching the native release-notes blueprint."""
+    date_cell = f'<time datetime="{html.escape(release_date)}" />' if release_date else ""
+    contrib_cell = "".join(
+        f'<ac:link><ri:user ri:account-id="{html.escape(a)}" ri:user-type="DEFAULT" /></ac:link>'
+        for a in contributor_ids
+    )
+
+    info = (
+        '<ac:structured-macro ac:name="info" ac:schema-version="1">'
+        "<ac:rich-text-body>"
+        "<p><strong>How to use this page:</strong></p>"
+        "<p>Find your selected Jira issues in the table below. Select the expand "
+        "to use them as your source of truth to write release notes.</p>"
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+
+    meta = (
+        '<table data-layout="default"><tbody>'
+        f'<tr><td data-highlight-colour="#F4F5F7"><p><strong>Release</strong></p></td>'
+        f'<td><p><a href="{html.escape(version_url)}">{html.escape(version_url)}</a></p></td></tr>'
+        f'<tr><td data-highlight-colour="#F4F5F7"><p><strong>Date</strong></p></td>'
+        f"<td><p>{date_cell}</p></td></tr>"
+        f'<tr><td data-highlight-colour="#F4F5F7"><p><strong>Version</strong></p></td>'
+        f"<td><p>{html.escape(version_name)}</p></td></tr>"
+        f'<tr><td data-highlight-colour="#F4F5F7"><p><strong>Description</strong></p></td>'
+        f"<td>{_desc_cell(description)}</td></tr>"
+        f'<tr><td data-highlight-colour="#F4F5F7"><p><strong>Contributors</strong></p></td>'
+        f"<td><p>{contrib_cell}</p></td></tr>"
+        "</tbody></table>"
+    )
+
+    rows = [
+        "<tr><th><p><strong>Issue</strong></p></th>"
+        "<th><p><strong>Summary</strong></p></th>"
+        "<th><p><strong>Issue Type</strong></p></th></tr>"
+    ]
+    for it in issues:
+        rows.append(
+            f"<tr><td><p>{_jira_issue_macro(it['key'])}</p></td>"
+            f"<td><p>{html.escape(it['summary'])}</p></td>"
+            f"<td><p>{html.escape(it['issuetype'])}</p></td></tr>"
+        )
+
+    expand = (
+        '<ac:structured-macro ac:name="expand" ac:schema-version="1" data-layout="wide">'
+        '<ac:parameter ac:name="title">Issues in this release</ac:parameter>'
+        "<ac:rich-text-body>"
+        '<ac:structured-macro ac:name="note" ac:schema-version="1"><ac:rich-text-body>'
+        "<p>Before you share the page, review the contents of each Jira issue and "
+        "remove any sensitive data.</p></ac:rich-text-body></ac:structured-macro>"
+        f'<table data-layout="default"><tbody>{"".join(rows)}</tbody></table>'
+        "</ac:rich-text-body></ac:structured-macro>"
+    )
+
+    return info + meta + expand
+
+
+@mcp.tool()
+def publish_release_notes(
+    project_key: str,
+    version_name: str,
+    space_key: str = "TS",
+    title: str | None = None,
+    parent_id: str | None = None,
+    include_contributors: bool = True,
+    max_results: int = 200,
+) -> str:
+    """Create a Confluence release-notes page for a version, native blueprint style.
+
+    Reproduces the page Jira's own "Release notes" wizard creates: an info panel,
+    a Release/Date/Version/Description/Contributors metadata table, and an expand
+    holding the issues table (a live Jira issue macro per key + its summary and
+    type as a frozen snapshot). A fresh, timestamped page is created each call —
+    the same as the native flow — so there is nothing to update in place.
+
+    Args:
+        project_key: Project key, e.g. 'TSP'
+        version_name: The version/release name (as shown in the project)
+        space_key: Confluence space to create the page in (default 'TS')
+        title: Page title. Default matches the native pattern
+            '<Mon DD HH:MM> - <project name> - <version>'.
+        parent_id: Optional parent page id to nest the page under
+        include_contributors: List the issues' assignees as contributors
+            (default True)
+        max_results: Cap on issues scanned (default 200, paginated internally)
+    """
+    query = (
+        f"project = {project_key} AND fixVersion = {_jql_literal(version_name)} "
+        "ORDER BY issuetype ASC, key ASC"
+    )
+
+    with _client() as client:
+        # Version metadata.
+        vresp = client.get(f"/rest/api/3/project/{project_key}/versions")
+        vresp.raise_for_status()
+        version = next((v for v in vresp.json() if v.get("name") == version_name), None)
+        if version is None:
+            return json.dumps(
+                {"error": "version_not_found",
+                 "detail": f"No version named {version_name!r} in {project_key}."},
+                indent=2,
+            )
+        version_id = version["id"]
+        release_date = version.get("releaseDate")
+        description = version.get("description") or ""
+
+        # Project display name for the title.
+        presp = client.get(f"/rest/api/3/project/{project_key}")
+        project_name = project_key
+        if presp.status_code < 400:
+            project_name = presp.json().get("name") or project_key
+
+        # Issues in the release.
+        raw_issues: list[dict] = []
+        next_token = None
+        while len(raw_issues) < max_results:
+            payload = {
+                "jql": query,
+                "fields": ["summary", "issuetype", "assignee"],
+                "maxResults": min(100, max_results - len(raw_issues)),
+            }
+            if next_token:
+                payload["nextPageToken"] = next_token
+            resp = client.post("/rest/api/3/search/jql", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            raw_issues.extend(data.get("issues", []))
+            next_token = data.get("nextPageToken")
+            if not next_token or not data.get("issues"):
+                break
+
+        issues = []
+        contributor_ids: list[str] = []
+        for raw in raw_issues:
+            f = raw.get("fields", {})
+            issues.append({
+                "key": raw["key"],
+                "summary": f.get("summary") or "",
+                "issuetype": (f.get("issuetype") or {}).get("name") or "",
+            })
+            if include_contributors:
+                assignee = f.get("assignee") or {}
+                acc = assignee.get("accountId")
+                if acc and acc not in contributor_ids:
+                    contributor_ids.append(acc)
+
+        if not issues:
+            return json.dumps(
+                {"error": "no_issues",
+                 "detail": f"No issues have fixVersion {version_name!r} in {project_key}; "
+                           "nothing to publish."},
+                indent=2,
+            )
+
+        if title is None:
+            title = f"{_datetime.now().strftime('%b %d %H:%M')} - {project_name} - {version_name}"
+        _require_english("title", title)
+
+        version_url = f"{JIRA_URL}/projects/{project_key}/versions/{version_id}"
+        body = _release_page_body(
+            version_url, version_name, release_date, description, issues, contributor_ids
+        )
+
+        space_id = _conf_space_id(client, space_key)
+        page_payload: dict = {
+            "spaceId": space_id,
+            "status": "current",
+            "title": title,
+            "body": {"representation": "storage", "value": body},
+        }
+        if parent_id:
+            page_payload["parentId"] = parent_id
+
+        cresp = client.post(f"{CONFLUENCE_BASE}/api/v2/pages", json=page_payload)
+        if cresp.status_code >= 400:
+            return json.dumps({"error": cresp.status_code, "body": cresp.text}, indent=2)
+        page = cresp.json()
+
+    return json.dumps({
+        "id": page["id"],
+        "title": page.get("title"),
+        "issues": len(issues),
+        "contributors": len(contributor_ids),
+        "url": _conf_page_url(page),
+    }, indent=2)
 
 
 if __name__ == "__main__":
